@@ -11,6 +11,34 @@ import os
 import mysql.connector
 from mysql.connector import Error
 
+connection = None
+cursor = None
+
+
+def init_db():
+    global connection, cursor
+    try:
+        # MySQL 데이터베이스에 연결
+        connection = mysql.connector.connect(
+            host='localhost',  # 호스트 이름
+            database=database,  # 데이터베이스 이름
+            user=database_user,  # 사용자 이름
+            password=database_password  # 비밀번호
+        )
+        if connection.is_connected():
+            cursor = connection.cursor(dictionary=True)
+            print("MySQL database connection established")
+    except Error as e:
+        print("Error while connecting to MySQL", e)
+
+
+def close_db():
+    global connection, cursor
+    if connection.is_connected():
+        cursor.close()
+        connection.close()
+        print("MySQL connection is closed")
+
 
 def get_transaction_amount(num, current_date):
     # 원화시장의 암호화폐 목록만 확인 = KRW를 통해 거래되는 코인만 불러오기
@@ -33,7 +61,7 @@ def get_transaction_amount(num, current_date):
         # count : 최근 며칠 치의 데이터 조회
         # to : 출력할 max date time
         # period : 데이터 요청 주기 (초)
-        df = pyupbit.get_ohlcv(ticker, interval='day', count=10, to=current_date, period=0.1)  # date 기간의 거래대금을 구해준다
+        df = pyupbit.get_ohlcv(ticker, interval='minute3', count=10, to=current_date, period=0.1)  # date 기간의 거래대금을 구해준다
         volume_money = 0.0
 
         if ticker == "KRW-BTC":
@@ -148,7 +176,7 @@ def check_coin():
     # currency : 자산 종류  (KRW = 원화, BTC = 비트코인, EOS = 이오스 등등)
     # balance : 보유 자산 현황
     # avg_buy_price : 평균 단가
-    # unit_currentcy : 평균 단가 단위
+    # unit_currency : 평균 단가 단위
     balances = upbit.get_balances()
 
     print(f"나의 계좌 정보 : {balances}")
@@ -246,12 +274,130 @@ def check_coin():
     #                     print("매수 실패")
 
 
+def get_balances():
+    global cursor
+    # 보유 자산 확인
+    cursor.execute("SELECT * FROM coins_held ORDER BY id DESC")
+    balances = cursor.fetchall()
+
+    print(f"보유 자산 : {balances}")
+    return balances
+
+
+def get_balance(currency):
+    global cursor
+    cursor = connection.cursor(dictionary=True)
+
+    # 특정 통화의 잔액 조회 쿼리
+    query = "SELECT balance FROM coins_held WHERE currency = %s"
+    cursor.execute(query, (currency,))
+    result = cursor.fetchone()
+
+    if result:
+        print(f"{currency} 잔액: {result['balance']}")
+        return result['balance']
+    else:
+        print(f"{currency} 통화의 잔액을 찾을 수 없습니다.")
+        return None
+
+def get_balance_for_currency(balances, currency):
+    for balance in balances:
+        if balance['currency'] == currency:
+            return float(balance['balance'])
+    return 0.0
+
+def update_balance(currency, new_balance):
+    global connection, cursor
+    try:
+        # 잔액 업데이트 쿼리
+        update_query = "UPDATE coins_held SET balance = %s, updated_at = %s WHERE currency = %s"
+        current_time = datetime.now()
+        cursor.execute(update_query, (new_balance, current_time, currency))
+        connection.commit()
+    except Error as e:
+        print("Error while updating balance", e)
+
+
+def buy_market_order(target_ticker, buy_money):
+    global connection, cursor
+    try:
+        # 현재 시간을 생성
+        current_time = datetime.now()
+
+        # 원화 잔액 가져오기
+        balances = get_balances()
+        my_money = get_balance_for_currency(balances, 'KRW')
+
+        if my_money < buy_money:
+            print("잔액이 부족합니다.")
+            return
+
+        # 원화 잔액 감소
+        new_krw_balance = my_money - buy_money
+        update_balance('KRW', new_krw_balance)
+
+        # 예시로 매수한 코인의 평균 매수 단가와 단위를 계산 (단순 예제)
+        unit_currency = 'KRW'  # 매수 통화 단위
+        avg_buy_price = buy_money  # 매수 평균 단가
+        balance = buy_money / avg_buy_price  # 매수한 코인의 수량 (단순 예제)
+
+        # 테이블에 행 삽입
+        insert_query = """
+           INSERT INTO coins_held (currency, unit_currency, balance, avg_buy_price, created_at, updated_at)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           """
+        cursor.execute(insert_query, (target_ticker, unit_currency, balance, avg_buy_price, current_time, current_time))
+        connection.commit()
+
+        print(f"시장가에 {target_ticker}를 {buy_money}{unit_currency}에 매수했습니다.")
+    except Error as e:
+        print("Error while executing query", e)
+
+
 def check_coin_test():
+    money_rate = 0.3  # 투자 비중
+    target_revenue = 2.5  # 목표 수익률(1.0 %)
+    target_loss = -3.0  # 3.0% 손실 날시 매도
+    min_ravenue = 0.1  # 최소 수익률
+
     # 현재 날짜를 저장하는 변수
     current_date = datetime.datetime.now().date()
 
     tickers = get_transaction_amount(10, current_date)  # 거래대금 상위 10개 코인 선정
     print(f"거래 대금 상위 10개 코인 : {tickers}")
+
+    balances = get_balances()
+
+    my_money = float(balances[0]['balance'])  # 내 원화
+    money = my_money * money_rate  # 코인에 할당할 비용
+    money = math.floor(money)  # 소수점 버림
+
+    fee = 0.0005
+
+    for target_ticker in tickers:
+        ticker_rate = get_revenue_rate(balances, target_ticker)
+        df_minute = pyupbit.get_ohlcv(target_ticker, interval="minute3")  # 1분봉 정보
+        rsi = get_rsi(df_minute, 15)
+        rsi14 = rsi.iloc[-1]  # 현재 RSI
+        before_rsi14 = rsi.iloc[-2]  # 직전 RSI
+
+        print(f"{target_ticker} 현재 RSI {rsi14}, 직전 RSI {before_rsi14} ")
+
+        # 매수
+        if before_rsi14 < 30:
+            if rsi14 > 30:
+                buy_money = money - (money * fee)
+                if buy_money < 5000 or (my_money - buy_money) < 5000:
+                    buy_money = get_balance('KRW')
+                    buy_money = (buy_money - (buy_money * fee))
+
+                try:
+                    print(
+                        f"매수 - {target_ticker}: 가격 {buy_money}에 {buy_money / pyupbit.get_current_price(target_ticker)}개 구매")
+                    buy_market_order(target_ticker, buy_money)  # 시장가에 비트코인을 매수
+                    balances = get_balances()  # 매수했으니 잔고를 최신화
+                except Exception as e:
+                    print(f"매수 실패 : {e}")
 
 
 load_dotenv()
@@ -262,51 +408,31 @@ database = os.getenv('DATABASE')
 database_user = os.getenv('DATABASE_USER')
 database_password = os.getenv('DATABASE_PASSWORD')
 
-try:
-    # MySQL 데이터베이스에 연결
-    connection = mysql.connector.connect(
-        host='localhost',  # 호스트 이름
-        database=database,  # 데이터베이스 이름
-        user=database_user,  # 사용자 이름
-        password=database_password  # 비밀번호
-    )
-    if connection.is_connected():
-        db_Info = connection.get_server_info()
-        print("Connected to MySQL Server version ", db_Info)
-        cursor = connection.cursor()
-        cursor.execute("select database();")
-        record = cursor.fetchone()
-        print("You're connected to database: ", record)
-
-except Error as e:
-    print("Error while connecting to MySQL", e)
-
-    # MySQL 연결을 종료합니다.
-    if (connection.is_connected()):
-        cursor.close()
-        connection.close()
-        print("MySQL connection is closed")
+init_db()
 
 # 객체 생성
 upbit = pyupbit.Upbit(access, secret)
+check_coin_test()
 
-# 백그라운드 스케줄러 생성
-scheduler = BackgroundScheduler()
+close_db()
 
-scheduler.add_job(check_coin_test, 'interval', seconds=120)
-
-# 스케줄러 시작
-scheduler.start()
-
-try:
-    # 작업 실행 시간 동안 프로그램 유지
-    while True:
-        time.sleep(1)
-except (KeyboardInterrupt, SystemExit):
-    # Ctrl+C 등 종료 시 스케줄러 중지
-    scheduler.shutdown()
-
-    if (connection.is_connected()):
-        cursor.close()
-        connection.close()
-        print("MySQL connection is closed")
+# # 백그라운드 스케줄러 생성
+# scheduler = BackgroundScheduler()
+#
+# scheduler.add_job(check_coin_test, 'interval', seconds=120)
+#
+# # 스케줄러 시작
+# scheduler.start()
+#
+# try:
+#     # 작업 실행 시간 동안 프로그램 유지
+#     while True:
+#         time.sleep(1)
+# except (KeyboardInterrupt, SystemExit):
+#     # Ctrl+C 등 종료 시 스케줄러 중지
+#     scheduler.shutdown()
+#
+#     if (connection.is_connected()):
+#         cursor.close()
+#         connection.close()
+#         print("MySQL connection is closed")
